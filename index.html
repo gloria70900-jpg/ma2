@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Digital Altar (Standalone)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center;
+            color: #fff; font-family: sans-serif; pointer-events: none; z-index: 100;
+        }
+        #startButton {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            padding: 20px 40px; font-size: 20px; font-weight: bold; cursor: pointer; 
+            background-color: #333; color: #fff; border: 2px solid #555; border-radius: 10px;
+            z-index: 200;
+        }
+        #startButton:hover { background-color: #555; }
+    </style>
+    <!-- Three.js CDN -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <button id="startButton">의식 시작 (Start Ritual)</button>
+    <div id="info">PC에서는 화면을 드래그하여 둘러볼 수 있습니다. VR 기기에서는 Enter VR을 누르세요.</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        let scene, camera, renderer, controls;
+        let controllers = [], controllerGrips = [];
+        let raycaster, workingMatrix;
+        
+        // 오디오 변수
+        let audioCtx, noiseNode, filterNode, gainNode, analyser;
+        let dataArray;
+        let currentNoise = "None";
+
+        // 양안 시차 및 모듈레이션 변수
+        let leftEyeFilter, rightEyeFilter;
+        let dichopticInterval = 5.0; 
+        let lastModulationTime = 0;
+        let targetColorL = new THREE.Color(), targetColorR = new THREE.Color();
+        let targetOpacityL = 0.1, targetOpacityR = 0.1;
+        
+        // UI 변수
+        let uiCanvas, uiContext, uiTexture, uiMesh;
+        let sliderHandle, sliderTrack;
+
+        // 동적 시각화 (비주얼라이저) 변수
+        let visualizerCanvas, visualizerCtx, visualizerTexture, visualizerMesh;
+        let particles, isExploding = false;
+        let fadeSphere;
+
+        const clock = new THREE.Clock();
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x050505);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            document.body.appendChild(VRButton.createButton(renderer));
+
+            // PC 테스트용 마우스 컨트롤
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.target.set(0, 1.5, -2);
+
+            // VR 컨트롤러 설정
+            const controllerModelFactory = new XRControllerModelFactory();
+            for (let i = 0; i < 2; i++) {
+                const controller = renderer.xr.getController(i);
+                controller.addEventListener('selectstart', onSelectStart);
+                controller.addEventListener('selectend', onSelectEnd);
+                scene.add(controller);
+                controllers.push(controller);
+
+                const grip = renderer.xr.getControllerGrip(i);
+                grip.add(controllerModelFactory.createControllerModel(grip));
+                scene.add(grip);
+                controllerGrips.push(grip);
+
+                const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]);
+                const material = new THREE.LineBasicMaterial({ color: 0xffffff });
+                controller.add(new THREE.Line(geometry, material));
+            }
+            raycaster = new THREE.Raycaster();
+            workingMatrix = new THREE.Matrix4();
+
+            // 양안 시차(Dichoptic) 필터 세팅
+            camera.layers.enable(1);
+            camera.layers.enable(2);
+            
+            const filterGeo = new THREE.PlaneGeometry(10, 10);
+            leftEyeFilter = new THREE.Mesh(filterGeo, new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.0, depthTest: false }));
+            leftEyeFilter.layers.set(1); 
+            leftEyeFilter.position.z = -0.5;
+            
+            rightEyeFilter = new THREE.Mesh(filterGeo, new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.0, depthTest: false }));
+            rightEyeFilter.layers.set(2);
+            rightEyeFilter.position.z = -0.5;
+
+            const cameraGroup = new THREE.Group();
+            cameraGroup.add(camera);
+            camera.add(leftEyeFilter);
+            camera.add(rightEyeFilter);
+            scene.add(cameraGroup);
+
+            // 동적 오디오 비주얼라이저 생성 (mp4 대체)
+            createVisualizer();
+            
+            // UI 생성
+            createUI();
+
+            // 암전 구체
+            const sphereGeo = new THREE.SphereGeometry(2, 32, 32);
+            const sphereMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, side: THREE.BackSide });
+            fadeSphere = new THREE.Mesh(sphereGeo, sphereMat);
+            camera.add(fadeSphere);
+
+            document.getElementById('startButton').addEventListener('click', () => {
+                initAudio();
+                document.getElementById('startButton').style.display = 'none';
+            });
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- 오디오 비주얼라이저 캔버스 (코드 자체 렌더링) ---
+        function createVisualizer() {
+            visualizerCanvas = document.createElement('canvas');
+            visualizerCanvas.width = 512;
+            visualizerCanvas.height = 512;
+            visualizerCtx = visualizerCanvas.getContext('2d');
+            visualizerTexture = new THREE.CanvasTexture(visualizerCanvas);
+
+            // AdditiveBlending을 사용해 배경이 없고 허공에 빛나는 홀로그램처럼 연출
+            const mat = new THREE.MeshBasicMaterial({ 
+                map: visualizerTexture, 
+                transparent: true, 
+                blending: THREE.AdditiveBlending,
+                side: THREE.DoubleSide
+            });
+            visualizerMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), mat);
+            visualizerMesh.position.set(0, 1.5, -2);
+            scene.add(visualizerMesh);
+        }
+
+        function updateVisualizer(time) {
+            if(!visualizerCtx) return;
+            visualizerCtx.clearRect(0, 0, 512, 512);
+
+            let audioIntensity = 0;
+            if (analyser && dataArray) {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                audioIntensity = sum / dataArray.length; // 오디오 반응 평균값
+            }
+
+            const centerX = 256;
+            const centerY = 256;
+            const baseRadius = 50 + audioIntensity * 0.5;
+
+            visualizerCtx.save();
+            visualizerCtx.translate(centerX, centerY);
+            visualizerCtx.rotate(time * 0.5);
+
+            // 빛나는 스펙트럼 문양 그리기
+            visualizerCtx.globalCompositeOperation = 'lighter';
+            for (let i = 0; i < 12; i++) {
+                visualizerCtx.rotate((Math.PI * 2) / 12);
+                visualizerCtx.beginPath();
+                visualizerCtx.moveTo(0, 0);
+                visualizerCtx.lineTo(baseRadius, baseRadius * 1.5);
+                visualizerCtx.lineTo(baseRadius * 2 + Math.sin(time*5)*20, 0);
+                
+                let gradient = visualizerCtx.createLinearGradient(0, 0, 200, 0);
+                gradient.addColorStop(0, `rgba(150, 100, 255, 0.8)`);
+                gradient.addColorStop(1, `rgba(50, 200, 255, 0.0)`);
+                
+                visualizerCtx.fillStyle = gradient;
+                visualizerCtx.fill();
+            }
+            
+            // 중앙 코어
+            visualizerCtx.beginPath();
+            visualizerCtx.arc(0, 0, baseRadius * 0.5, 0, Math.PI * 2);
+            visualizerCtx.fillStyle = '#ffffff';
+            visualizerCtx.fill();
+
+            visualizerCtx.restore();
+            visualizerTexture.needsUpdate = true;
+        }
+
+        // --- 오디오 생성 및 분석 (Web Audio API) ---
+        function initAudio() {
+            if(audioCtx) return;
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+            
+            const bufferSize = audioCtx.sampleRate * 2;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1; // 화이트 노이즈
+            }
+            
+            noiseNode = audioCtx.createBufferSource();
+            noiseNode.buffer = buffer;
+            noiseNode.loop = true;
+
+            filterNode = audioCtx.createBiquadFilter();
+            filterNode.type = 'lowpass';
+            filterNode.frequency.value = 1000;
+
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 64;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            gainNode = audioCtx.createGain();
+            gainNode.gain.value = 0.3; // 소리 크기
+
+            noiseNode.connect(filterNode);
+            filterNode.connect(analyser);
+            analyser.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            noiseNode.start();
+        }
+
+        function setNoiseColor(type) {
+            if (!audioCtx) return;
+            currentNoise = type;
+            switch(type) {
+                case 'Brown': filterNode.type = 'lowpass'; filterNode.frequency.value = 200; break;
+                case 'Pink': filterNode.type = 'lowpass'; filterNode.frequency.value = 800; break;
+                case 'White': filterNode.type = 'allpass'; break;
+                case 'Purple': filterNode.type = 'highpass'; filterNode.frequency.value = 3000; break;
+            }
+            updateCanvasUI();
+        }
+
+        // --- UI 생성 ---
+        function createUI() {
+            uiCanvas = document.createElement('canvas');
+            uiCanvas.width = 512; uiCanvas.height = 256;
+            uiContext = uiCanvas.getContext('2d');
+            uiTexture = new THREE.CanvasTexture(uiCanvas);
+
+            uiMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.5), new THREE.MeshBasicMaterial({ map: uiTexture, transparent: true }));
+            uiMesh.position.set(0, 0.8, -1.5);
+            uiMesh.rotation.x = -Math.PI / 8;
+            scene.add(uiMesh);
+
+            sliderTrack = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.02, 0.02), new THREE.MeshBasicMaterial({ color: 0x555555 }));
+            sliderTrack.position.set(0, 0.6, -1.45);
+            sliderTrack.rotation.x = -Math.PI / 8;
+            scene.add(sliderTrack);
+
+            sliderHandle = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.06), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+            sliderHandle.position.copy(sliderTrack.position);
+            sliderHandle.position.x = -0.4;
+            scene.add(sliderHandle);
+
+            updateCanvasUI();
+        }
+
+        function updateCanvasUI() {
+            uiContext.fillStyle = 'rgba(0, 0, 0, 0.8)';
+            uiContext.fillRect(0, 0, 512, 256);
+            uiContext.fillStyle = '#ffffff';
+            uiContext.textAlign = 'center';
+            
+            uiContext.font = '36px sans-serif';
+            uiContext.fillText(`Noise: ${currentNoise}`, 256, 60);
+            
+            uiContext.font = '24px sans-serif';
+            uiContext.fillText("Quest: A/B/X/Y | PC: 1/2/3/4 Key", 256, 110);
+            uiContext.fillText("Trigger(Click) Visualizer to Explode", 256, 150);
+            
+            uiContext.fillText(`Modulation: ${dichopticInterval.toFixed(1)} s`, 256, 210);
+            uiTexture.needsUpdate = true;
+        }
+
+        // --- 인터랙션 로직 ---
+        function onSelectStart(event) {
+            const controller = event.target;
+            workingMatrix.identity().extractRotation(controller.matrixWorld);
+            raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+            raycaster.ray.direction.set(0, 0, -1).applyMatrix4(workingMatrix);
+
+            const intersects = raycaster.intersectObjects([visualizerMesh, sliderHandle]);
+            if (intersects.length > 0) {
+                if (intersects[0].object === visualizerMesh && !isExploding) {
+                    triggerClimax(); // 홀로그램 비주얼라이저 쏘면 폭발
+                } else if (intersects[0].object === sliderHandle) {
+                    controller.userData.selected = sliderHandle;
+                }
+            }
+        }
+
+        function onSelectEnd(event) {
+            if (event.target.userData.selected) {
+                event.target.userData.selected = undefined;
+            }
+        }
+
+        // PC 테스트용 클릭 이벤트 (마우스로 스펙트럼 클릭 시 폭발)
+        window.addEventListener('pointerdown', (e) => {
+            if(isExploding || !visualizerMesh) return;
+            const mouse = new THREE.Vector2(
+                (e.clientX / window.innerWidth) * 2 - 1,
+                -(e.clientY / window.innerHeight) * 2 + 1
+            );
+            raycaster.setFromCamera(mouse, camera);
+            if (raycaster.intersectObject(visualizerMesh).length > 0) triggerClimax();
+        });
+
+        // PC 테스트용 키보드 이벤트 (노이즈 변경)
+        window.addEventListener('keydown', (e) => {
+            if(e.key === '1') setNoiseColor('Brown');
+            if(e.key === '2') setNoiseColor('Pink');
+            if(e.key === '3') setNoiseColor('White');
+            if(e.key === '4') setNoiseColor('Purple');
+        });
+
+        function handleGamepadInput() {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                const buttons = source.gamepad.buttons;
+                if (source.handedness === 'right') {
+                    if (buttons[4]?.pressed) setNoiseColor('Brown'); 
+                    if (buttons[5]?.pressed) setNoiseColor('Pink');  
+                } else if (source.handedness === 'left') {
+                    if (buttons[4]?.pressed) setNoiseColor('White'); 
+                    if (buttons[5]?.pressed) setNoiseColor('Purple');
+                }
+            }
+        }
+
+        function triggerClimax() {
+            isExploding = true;
+            visualizerMesh.visible = false;
+            
+            const partGeo = new THREE.BufferGeometry();
+            const partCount = 3000;
+            const posArray = new Float32Array(partCount * 3);
+            const velArray = [];
+            
+            for(let i=0; i<partCount; i++) {
+                posArray[i*3] = visualizerMesh.position.x + (Math.random()-0.5)*0.5;
+                posArray[i*3+1] = visualizerMesh.position.y + (Math.random()-0.5)*0.5;
+                posArray[i*3+2] = visualizerMesh.position.z;
+                velArray.push((Math.random()-0.5)*0.15, (Math.random()-0.5)*0.15, (Math.random()*0.15));
+            }
+            partGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+            particles = new THREE.Points(partGeo, new THREE.PointsMaterial({ size: 0.03, color: 0xaa55ff, transparent: true }));
+            particles.userData.velocities = velArray;
+            scene.add(particles);
+
+            if(gainNode) gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 1.5);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            if (controls) controls.update();
+            handleGamepadInput();
+            
+            if (!isExploding) updateVisualizer(time);
+
+            controllers.forEach((controller) => {
+                if (controller.userData.selected === sliderHandle) {
+                    workingMatrix.identity().extractRotation(controller.matrixWorld);
+                    raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+                    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(workingMatrix);
+                    
+                    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 1.45);
+                    const target = new THREE.Vector3();
+                    raycaster.ray.intersectPlane(plane, target);
+                    
+                    let newX = Math.max(-0.4, Math.min(0.4, target.x));
+                    sliderHandle.position.x = newX;
+                    dichopticInterval = 5.0 + ((newX + 0.4) / 0.8) * 10.0;
+                    updateCanvasUI();
+                }
+            });
+
+            if (time - lastModulationTime > dichopticInterval) {
+                targetColorL.setHSL(Math.random(), 0.8, 0.2);
+                targetColorR.setHSL(Math.random(), 0.8, 0.2);
+                targetOpacityL = 0.05 + Math.random() * 0.15;
+                targetOpacityR = 0.05 + Math.random() * 0.15;
+                lastModulationTime = time;
+            }
+
+            let flickerL = Math.sin(time * 5.0) * 0.02;
+            let flickerR = Math.cos(time * 4.5) * 0.02;
+
+            leftEyeFilter.material.color.lerp(targetColorL, delta * 2.0);
+            rightEyeFilter.material.color.lerp(targetColorR, delta * 2.0);
+            leftEyeFilter.material.opacity = THREE.MathUtils.lerp(leftEyeFilter.material.opacity, targetOpacityL + flickerL, delta * 5.0);
+            rightEyeFilter.material.opacity = THREE.MathUtils.lerp(rightEyeFilter.material.opacity, targetOpacityR + flickerR, delta * 5.0);
+
+            if (isExploding && particles) {
+                const positions = particles.geometry.attributes.position.array;
+                const vels = particles.userData.velocities;
+                for(let i=0; i<positions.length/3; i++) {
+                    positions[i*3] += vels[i*3];
+                    positions[i*3+1] += vels[i*3+1];
+                    positions[i*3+2] += vels[i*3+2];
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+                particles.material.opacity -= delta * 0.4;
+                fadeSphere.material.opacity = Math.min(1.0, fadeSphere.material.opacity + delta * 0.3);
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
